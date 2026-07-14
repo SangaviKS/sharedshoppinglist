@@ -17,3 +17,6 @@ frontend/dist/
 
 # OS
 .DS_Store
+
+# Personal notes, not part of the graded solution
+challenge1/MY_NOTES.md
