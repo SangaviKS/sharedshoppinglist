@@ -262,7 +262,7 @@ docker compose down -v    # wipes the database volume too — only for resetting
 Full detail lives in `challenge1/runbook.md`; the high-level flow is:
 
 1. Push this repo to a new GitHub repository (it's git-initialized locally but has no remote yet).
-2. Launch a `t3.micro` (or `t3.small`) Ubuntu 22.04 EC2 instance via the AWS Console, with a security group allowing only 22 (SSH, from your IP), 80, and 443, and an Elastic IP attached so the address is stable.
+2. Launch a `t3.micro` (or `t3.small`) Ubuntu LTS EC2 instance via the AWS Console, with a security group allowing only 22 (SSH, from your IP), 80, and 443, and an Elastic IP attached so the address is stable.
 3. SSH in, install Docker, Docker Compose, and Nginx.
 4. `git clone` the repo onto the instance and create the real `.env` there (strong `POSTGRES_PASSWORD`, `VITE_API_URL` set to your real domain or a free `nip.io` hostname).
 5. `docker compose up --build -d`.
@@ -271,9 +271,46 @@ Full detail lives in `challenge1/runbook.md`; the high-level flow is:
 8. Verify over HTTPS, including re-running the restart/persistence check from step 5 above against the live site.
 9. Set a small AWS Budget alert and know how to stop (not just terminate) the instance to control cost.
 
+## Live deployment
+
+The runbook above wasn't just written — it was executed end to end against
+a real AWS account. Final state:
+
+- **URL**: https://3-227-138-40.nip.io (Elastic IP `3.227.138.40`, no
+  owned domain needed — a free `nip.io` wildcard hostname was used instead)
+- **Instance**: `t3.micro`, Ubuntu 26.04 LTS, `us-east-1`
+- **Repo**: https://github.com/SangaviKS/sharedshoppinglist (public — safe
+  since `.env` with real secrets is git-ignored and was never committed)
+- **HTTPS**: Let's Encrypt certificate via Certbot, auto-renewing, expires
+  2026-10-12
+- **Budget alert**: set at $1, well under the $100 ceiling
+
+Issues hit and resolved during the real deployment (beyond the Docker
+issues in the troubleshooting section above):
+- A private key downloaded from the EC2 console defaults to `644`
+  permissions, which SSH rejects — fixed with `chmod 400`.
+- `.env.example`'s placeholder `VITE_API_URL` (`203-0-113-10.nip.io`, a
+  documentation-only example IP) was initially copied in verbatim instead
+  of being replaced with the instance's real Elastic-IP-based hostname —
+  caught before the frontend was built against the wrong origin.
+- The runbook's example password-generation command (`openssl rand -base64
+  24`) can produce `/` and `+` characters that break the `DATABASE_URL`
+  connection string once substituted in; switched to `openssl rand -hex
+  24`, which is alphanumeric-only and safe to embed directly.
+
+End-to-end verification that was actually performed on the live site:
+1. `docker compose ps` — all three containers up and healthy.
+2. `curl` against the app both from `127.0.0.1` on the instance and from
+   outside over `http://` and `https://` — all returned expected responses.
+3. Added an item through the real browser UI, ran
+   `docker compose restart backend` on the instance, and confirmed the item
+   was still there afterward — the exact chaos-test scenario from the
+   Challenge 1 README, now passing against a live production deployment
+   instead of just localhost.
+
 ## What this solves for Challenge 1
 
-- the original app lost items after restarts — fixed with a persistent database
+- the original app lost items after restarts — fixed with a persistent database, and confirmed fixed on a live deployment, not just locally
 - the containerized version now matches what you'd actually run in production — a compiled frontend, an internal-only database, secrets outside the compose file, and ports that aren't exposed to the internet except through the reverse proxy
 - there's a concrete, verified path from "runs on my laptop" to "live on a public HTTPS domain on a single EC2 instance," within the $100 budget
 
