@@ -1,0 +1,19 @@
+.github/instructions/wmt-copilot.instructions.md
+
+# Python
+.venv/
+backend/venv/
+__pycache__/
+*.pyc
+*.db
+
+# Node
+node_modules/
+frontend/dist/
+
+# Env / secrets
+.env
+*.pem
+
+# OS
+.DS_Store
