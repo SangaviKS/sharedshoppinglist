@@ -3,26 +3,30 @@
 
 ## What changed
 
-The starter app originally stored shopping list items only in the backend process memory. That meant every restart erased the data. To address Challenge 1, I moved the app toward a more production-ready foundation by introducing a persistent data store and deployment assets.
+The starter app originally stored shopping list items only in the backend process memory. That meant every restart erased the data. To address Challenge 1, the app was moved toward a production-ready foundation in two passes:
+
+1. **Step 1** (GitHub Copilot): added a persistent data store (SQLite locally, Postgres in Docker), a `docker-compose.yml` for the three-service stack, and a first draft of an AWS EC2 deployment runbook.
+2. **Step 2** (Claude): hardened that Docker/runbook work into something that's actually safe to put on the public internet — no exposed database port, no hardcoded credentials, a real compiled frontend build instead of a dev server, a git repo to deploy from, and a rewritten runbook with concrete AWS Console steps, a path-based Nginx routing setup, and budget guardrails. All of it was then verified end-to-end by actually building and running the stack.
 
 ## Why these changes were made
 
-The main problem in the starter app was that it had no durable persistence layer. If the backend restarted, the shopping list disappeared. Challenge 1 is about fixing that by moving from ephemeral in-memory state to a more reliable architecture.
+The main problem in the starter app was that it had no durable persistence layer. If the backend restarted, the shopping list disappeared. Challenge 1 is about fixing that by moving from ephemeral in-memory state to a more reliable architecture, containerizing it, and deploying it live on AWS within a $100 budget.
 
 The changes below were made to:
 - keep data after a restart
 - make the app easier to run in containers
-- prepare the project for later deployment to a cloud host
+- make the containerized stack safe to expose on the public internet
+- prepare the project for deployment to a single AWS EC2 instance
 
 ## Implemented changes
 
 ### 1. Persistent storage
-I updated the backend so it stores items in a SQLite database file instead of only in Python memory.
+The backend stores items in a database instead of only in Python memory — SQLite for local, non-Docker development, and Postgres when running under Docker Compose.
 
 Why this helps:
 - data survives backend restarts
 - the app behaves more like a real service
-- it is a good local stepping stone before moving to PostgreSQL in production
+- SQLite is a good local stepping stone before moving to Postgres in production
 
 The backend now:
 - creates a table for shopping list items on startup
@@ -31,91 +35,100 @@ The backend now:
 - marks completed items and deletes items through database operations
 
 ### 2. Backend API improvements
-The API routes were updated to:
+The API routes:
 - return items from the database
 - validate incoming item data
 - return useful HTTP errors for invalid input
-- use clearer request handling for create, complete, and delete operations
-
-This makes the backend more robust than the original starter version.
+- use clear request handling for create, complete, and delete operations
 
 ### 3. Frontend configuration update
-The frontend now uses an environment variable for the API URL:
+The frontend reads the API base URL from an environment variable:
 - `VITE_API_URL`
 
-Why this helps:
-- the same frontend can target different backend hosts
-- it is easier to support Docker and cloud deployment later
+This is a Vite **build-time** variable — it gets baked into the compiled JS bundle when the image is built, not read at container start. That matters for deployment: changing it means rebuilding the frontend image (`docker compose up --build -d frontend`), not just restarting the container. In production it's set to the app's own public HTTPS domain (e.g. `https://shoppinglist.yourdomain.com`), so the frontend and backend are same-origin and there's no CORS to configure — the host Nginx splits traffic by path instead (see the runbook).
 
 ### 4. Docker support
-I added Docker files so the app can be run in containers.
+Files added: `docker-compose.yml`, `backend/Dockerfile`, `frontend/Dockerfile`.
 
-Files added:
-- `docker-compose.yml`
-- `backend/Dockerfile`
-- `frontend/Dockerfile`
+The frontend Dockerfile was reworked from Step 1's version, which ran `vite dev` inside the container (a dev server, not something you'd put on the internet), to a proper multi-stage production build:
 
-This creates a container-based setup for:
-- the backend
-- the frontend
-- a database service
+```dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY . .
+ARG VITE_API_URL
+ENV VITE_API_URL=$VITE_API_URL
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+`docker-compose.yml` was also hardened:
+- **No public database port.** The original compose file mapped `5432:5432`, putting Postgres directly on the internet with the default `postgres`/`postgres` credentials. The `db` service now has no `ports:` entry at all — it's reachable only from other containers on the compose network, by the hostname `db`.
+- **Secrets moved to `.env`.** `POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB`, and `VITE_API_URL` are read from a git-ignored `.env` file (see `.env.example` for the template) instead of being hardcoded in the compose file.
+- **App ports bound to localhost only.** `backend` (8000) and `frontend` (80→8080) are published as `127.0.0.1:PORT:PORT`, not `0.0.0.0`. On the EC2 host, that means the only way in from the public internet is through the Nginx reverse proxy in front of them — even if the security group were misconfigured, the containers themselves aren't reachable from outside the box.
+- **`restart: unless-stopped`** on all three services, so the stack comes back up automatically after an instance reboot.
 
 ### 5. Deployment runbook
-I also added a deployment guide at:
-- `challenge1/runbook.md`
-
-This guide explains a basic AWS EC2 deployment flow using:
-- Docker Compose
-- Nginx as a reverse proxy
-- Let's Encrypt for HTTPS
+Located at `challenge1/runbook.md`, rewritten to cover, in order:
+- pushing this project to a new GitHub repo (it wasn't a git repo before Step 2)
+- launching a `t3.micro`/`t3.small` EC2 instance via the AWS Console, with a security group open only on 22/80/443 and an Elastic IP so the address survives reboots
+- a no-domain option using free wildcard DNS (`nip.io`) if you don't own a domain
+- installing Docker, Docker Compose, and Nginx on the instance
+- cloning the repo and creating the real `.env` on the server
+- a host Nginx config that routes `/items*` to the backend container and everything else to the frontend container, so both are served from one HTTPS origin
+- Let's Encrypt via Certbot, including certificate auto-renewal
+- an end-to-end verification checklist (including re-running the restart/persistence check against the live deployment)
+- cost/budget guardrails (Free Tier eligibility, Elastic IP billing gotcha, how to pause vs. terminate)
 
 ## Docker troubleshooting and fixes
-The Docker setup went through several real issues while bringing the app up. These are the problems that were found and the updates that made it work.
+The Docker setup went through several real issues while bringing the app up, across both passes. These are the problems that were found and the updates that made it work.
 
 ### 1. Build failed because the requirements file contained an invalid comment line
 The first Docker build failed with an error from pip saying that the requirements file contained an invalid requirement.
 
-Root cause:
-- the requirements file had a generated comment line at the top
-- pip treated that line as a package name and stopped the build
+Root cause: the requirements file had a generated comment line at the top, and pip treated that line as a package name.
 
-Fix applied:
-- updated `backend/Dockerfile` to strip comment-style marker lines before running `pip install`
-- this allows the image build to continue normally
+Fix applied: `backend/Dockerfile` strips comment-style marker lines before running `pip install`.
 
 ### 2. The backend container could not start because PostgreSQL support was missing
-After the initial build issue was resolved, the backend container failed with a Python import error:
-- `ModuleNotFoundError: No module named psycopg2`
+`ModuleNotFoundError: No module named psycopg2`.
 
-Root cause:
-- the backend was configured to use PostgreSQL inside Docker, but the Python dependency for the PostgreSQL driver was not installed
+Root cause: the backend was configured to use PostgreSQL inside Docker, but the Python driver wasn't installed.
 
-Fix applied:
-- added `psycopg2-binary` to `backend/requirements.txt`
+Fix applied: added `psycopg2-binary` to `backend/requirements.txt`.
 
 ### 3. PostgreSQL startup failed because SQLite-only connection settings were being applied
-Once the database driver was installed, the backend reached the database layer but then failed with:
-- `invalid dsn: invalid connection option "check_same_thread"`
+`invalid dsn: invalid connection option "check_same_thread"`.
 
-Root cause:
-- the code was applying SQLite-specific engine options to every database connection
-- those options are valid for SQLite but not for PostgreSQL
+Root cause: SQLite-specific engine options were being applied to every database connection, including Postgres.
 
-Fix applied:
-- updated `backend/main.py` so the special SQLite connection settings are only used when the database URL starts with `sqlite`
-- this keeps local SQLite development working while allowing Docker PostgreSQL to connect properly
+Fix applied: `backend/main.py` only applies the SQLite-specific connect args when `DATABASE_URL` starts with `sqlite`, keeping both local SQLite and Docker Postgres working.
 
-### 4. Verified Docker run flow
-The following steps were used to verify the Docker stack end to end:
-
-From the project root, run:
-```bash
-docker compose down
-docker compose up --build -d
+### 4. Stale Postgres data volume rejected the new password after hardening secrets
+When the DB password was moved out of the hardcoded `docker-compose.yml` value and into `.env`, the backend started crash-looping with:
+```
+sqlalchemy.exc.OperationalError: ... FATAL: password authentication failed for user "postgres"
 ```
 
-Then confirm the containers are running:
+Root cause: Postgres only sets the superuser password the **first time** it initializes an empty data directory. The named volume (`postgres_data`) from earlier test runs had already been initialized with the old default password, so it silently ignored the new one from `.env`.
+
+Fix applied: for this local test data, the fix was to reset the volume:
 ```bash
+docker compose down -v
+docker compose up --build -d
+```
+This is a one-time local-testing wrinkle. On a fresh EC2 instance, the volume doesn't exist yet, so the password from `.env` applies correctly the first time. (Doing `down -v` against a deployment with real data would delete that data — don't run it there.)
+
+### 5. Verified Docker run flow
+From the project root:
+```bash
+docker compose up --build -d
 docker compose ps
 ```
 
@@ -125,16 +138,15 @@ curl http://localhost:8000/
 curl http://localhost:8000/items
 ```
 
-Expected results:
-- the root endpoint returns a JSON message
-- the items endpoint returns an empty list at first, or any items already stored
+Expected results: the root endpoint returns a JSON message, and the items endpoint returns an empty list at first, or any items already stored.
 
-### 5. Summary of updates that made Docker work
-The Docker setup now works because of these updates:
+### 6. Summary of updates that made Docker work
 - `backend/requirements.txt` includes the PostgreSQL driver
 - `backend/Dockerfile` installs dependencies safely even when the file contains comment markers
 - `backend/main.py` uses database-specific engine settings for SQLite versus PostgreSQL
-- the app is now able to start correctly in Docker and serve both the frontend and API
+- `frontend/Dockerfile` compiles a production build instead of running a dev server
+- `docker-compose.yml` keeps the database off the public network and reads secrets from `.env`
+- the app starts correctly in Docker and serves both the frontend and API, with data that survives container restarts
 
 ## How to run locally before Docker
 
@@ -162,57 +174,109 @@ Uvicorn running on http://127.0.0.1:8000
 ```
 
 ### 2. Verify the backend API
-In a second terminal, test the backend with:
+In a second terminal:
 ```bash
 curl http://127.0.0.1:8000/
 curl http://127.0.0.1:8000/items
 ```
 
-Expected results:
-- `/` should return a JSON message
-- `/items` should return an empty list at first
+Expected results: `/` returns a JSON message, `/items` returns an empty list at first.
 
 ### 3. Start the frontend
-In a third terminal, run:
+In a third terminal:
 ```bash
 cd frontend
 npm install
 npm run dev -- --host 127.0.0.1
 ```
 
-Then open the app in your browser at:
-- http://127.0.0.1:5173
+Then open the app at http://127.0.0.1:5173.
 
 ### 4. Test the app manually
-Try the following:
 1. Add an item in the UI
 2. Refresh the page
 3. Confirm the item still appears
 4. Mark it complete
 5. Delete it
 
-If the app responds correctly, the local version is working before Docker is introduced.
-
 ### 5. If port 8000 is already in use
-If you see an error like "address already in use", stop the old process first and try again:
 ```bash
 lsof -nP -iTCP:8000 -sTCP:LISTEN
 kill <PID>
 ```
 
 ### 6. If port 5173 is already in use
-If Vite reports that port 5173 is busy, stop the old process or use a different port:
 ```bash
 npm run dev -- --host 127.0.0.1 --port 5174
 ```
 
+## How to run the full Docker stack locally
+
+This exercises the same three containers (`db`, `backend`, `frontend`) that get deployed to EC2, so it's the closest local approximation to production.
+
+### 1. Create your local `.env`
+```bash
+cp .env.example .env
+```
+Edit `.env` and set `VITE_API_URL=http://localhost:8000` — locally there's no host Nginx splitting traffic by path, so the frontend needs to hit the backend's published port directly. (On the real deployment, this instead gets set to your public HTTPS domain — see the runbook.)
+
+### 2. Build and start
+```bash
+docker compose up --build -d
+docker compose ps
+```
+All three services (`db`, `backend`, `frontend`) should show `Up`.
+
+### 3. Verify the backend
+```bash
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/items
+```
+
+### 4. Verify the frontend
+```bash
+curl -I http://127.0.0.1:8080/
+```
+Or open http://localhost:8080 in a browser.
+
+### 5. Verify persistence (the actual point of Challenge 1)
+```bash
+curl -X POST http://127.0.0.1:8000/items \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Oat Milk","quantity":2,"added_by":"test"}'
+
+docker compose restart backend
+
+curl http://127.0.0.1:8000/items
+```
+The item added before the restart should still be there afterward — confirming the chaos-test failure mode from the challenge (in-memory state wiped on restart) is fixed.
+
+### 6. Tear down
+```bash
+docker compose down       # keeps data (named volume persists)
+docker compose down -v    # wipes the database volume too — only for resetting test data
+```
+
+## Step-by-step: deploying to AWS EC2
+
+Full detail lives in `challenge1/runbook.md`; the high-level flow is:
+
+1. Push this repo to a new GitHub repository (it's git-initialized locally but has no remote yet).
+2. Launch a `t3.micro` (or `t3.small`) Ubuntu 22.04 EC2 instance via the AWS Console, with a security group allowing only 22 (SSH, from your IP), 80, and 443, and an Elastic IP attached so the address is stable.
+3. SSH in, install Docker, Docker Compose, and Nginx.
+4. `git clone` the repo onto the instance and create the real `.env` there (strong `POSTGRES_PASSWORD`, `VITE_API_URL` set to your real domain or a free `nip.io` hostname).
+5. `docker compose up --build -d`.
+6. Configure the host Nginx site to route `/items*` to the backend container and everything else to the frontend container.
+7. Run Certbot (`certbot --nginx -d your-domain`) to get a free Let's Encrypt certificate with automatic renewal.
+8. Verify over HTTPS, including re-running the restart/persistence check from step 5 above against the live site.
+9. Set a small AWS Budget alert and know how to stop (not just terminate) the instance to control cost.
+
 ## What this solves for Challenge 1
 
-This solution addresses the core challenge problem:
-- the original app lost items after restarts
-- the updated app keeps data in a persistent store
-- the project is now closer to a real deployment architecture
+- the original app lost items after restarts — fixed with a persistent database
+- the containerized version now matches what you'd actually run in production — a compiled frontend, an internal-only database, secrets outside the compose file, and ports that aren't exposed to the internet except through the reverse proxy
+- there's a concrete, verified path from "runs on my laptop" to "live on a public HTTPS domain on a single EC2 instance," within the $100 budget
 
 ## Notes
 
-The local implementation uses SQLite for simplicity and reliability during development. In a production deployment, the next step would be to move from SQLite to PostgreSQL, which is also what Challenge 1 describes.
+The local, non-Docker path still uses SQLite for simplicity during day-to-day development. The Docker Compose stack — and therefore the AWS deployment — uses Postgres, which is what Challenge 1 asks for in production.
